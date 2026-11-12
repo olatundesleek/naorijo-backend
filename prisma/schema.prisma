@@ -1,0 +1,383 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum UserStatus {
+  ACTIVE
+  DISABLED
+  PENDING
+}
+
+enum PlatformRole {
+  SUPER_ADMIN
+  PLATFORM_ADMIN
+  PLATFORM_SUPPORT
+  PLATFORM_VIEWER
+}
+
+enum CompanyRole {
+  ADMIN
+  PRODUCT_MANAGER
+  EDITOR
+}
+
+enum MembershipStatus {
+  ACTIVE
+  SUSPENDED
+  INVITED
+}
+
+enum ItemStatus {
+  ACTIVE
+  REVOKED
+  RECALLED
+}
+
+enum OveruseAction {
+  WARN
+  BLOCK
+}
+
+enum VerificationEventType {
+  PAGE_OPENED
+  CODE_SUBMITTED
+  VERIFICATION_SUCCEEDED
+  VERIFICATION_FAILED
+  OVERUSE_WARNING
+  VERIFICATION_BLOCKED
+}
+
+enum SubscriptionStatus {
+  TRIALING
+  ACTIVE
+  PAST_DUE
+  CANCELED
+  EXPIRED
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+  REFUNDED
+}
+
+model User {
+  id              String          @id @default(cuid())
+  displayId       String          @unique
+  email           String          @unique
+  passwordHash    String
+  firstName       String
+  middleName      String?
+  lastName        String
+  status          UserStatus      @default(ACTIVE)
+  emailVerifiedAt DateTime?
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+  sessions        LoginSession[]
+  memberships     CompanyMember[]
+  platformMembership PlatformMember?
+  auditLogs       AuditLog[]
+  invitations     Invitation[]    @relation("InvitationInviter")
+  emailVerificationTokens EmailVerificationToken[]
+  passwordResetTokens PasswordResetToken[]
+  printExportJobs PrintExportJob[] @relation("PrintExportCreator")
+}
+
+model PlatformMember {
+  id        String           @id @default(cuid())
+  userId    String           @unique
+  role      PlatformRole
+  status    MembershipStatus @default(ACTIVE)
+  createdAt DateTime         @default(now())
+  updatedAt DateTime         @updatedAt
+  user      User             @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([status, role])
+}
+
+model LoginSession {
+  id          String    @id @default(cuid())
+  userId      String
+  tokenHash   String    @unique
+  deviceLabel String?
+  ipAddress   String?
+  userAgent   String?
+  createdAt   DateTime  @default(now())
+  lastSeenAt  DateTime  @default(now())
+  expiresAt   DateTime
+  revokedAt   DateTime?
+  user        User      @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([userId, revokedAt, expiresAt])
+}
+
+model Company {
+  id                      String           @id @default(cuid())
+  displayId               String           @unique
+  name                    String
+  slug                    String           @unique
+  isActive                Boolean          @default(true)
+  defaultMaxSuccessfulUses Int              @default(1)
+  defaultOveruseAction    OveruseAction    @default(WARN)
+  defaultOveruseMessage   String?
+  createdAt               DateTime         @default(now())
+  updatedAt               DateTime         @updatedAt
+  members                 CompanyMember[]
+  products                Product[]
+  auditLogs               AuditLog[]
+  subscriptions           Subscription[]
+  invitations             Invitation[]
+  idempotencyKeys         IdempotencyKey[]
+  printExportJobs         PrintExportJob[]
+}
+
+model CompanyMember {
+  id        String           @id @default(cuid())
+  userId    String
+  companyId String
+  role      CompanyRole
+  status    MembershipStatus @default(ACTIVE)
+  createdAt DateTime         @default(now())
+  updatedAt DateTime         @updatedAt
+  user      User             @relation(fields: [userId], references: [id], onDelete: Restrict)
+  company   Company          @relation(fields: [companyId], references: [id], onDelete: Restrict)
+
+  @@unique([userId, companyId])
+  @@index([companyId, status, role])
+  @@index([userId, status])
+}
+
+model Product {
+  id                      String        @id @default(cuid())
+  displayId               String        @unique
+  companyId               String
+  name                    String
+  slug                    String
+  description             String?
+  isActive                Boolean       @default(true)
+  maxSuccessfulUses       Int?
+  overuseAction           OveruseAction?
+  overuseMessage          String?
+  createdAt               DateTime      @default(now())
+  updatedAt               DateTime      @updatedAt
+  company                 Company       @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  batches                 Batch[]
+
+  @@unique([companyId, slug])
+  @@index([companyId, isActive, createdAt])
+}
+
+model Batch {
+  id             String    @id @default(cuid())
+  displayId      String    @unique
+  productId      String
+  batchNumber    String
+  productionDate DateTime?
+  expiryDate     DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  product        Product   @relation(fields: [productId], references: [id], onDelete: Restrict)
+  items          Item[]
+
+  @@unique([productId, batchNumber])
+  @@index([productId, createdAt])
+}
+
+model Item {
+  id                  String        @id @default(cuid())
+  displayId           String        @unique
+  batchId             String
+  publicToken         String        @unique
+  verificationCodeHash String       @unique
+  status              ItemStatus    @default(ACTIVE)
+  successfulUses      Int           @default(0)
+  maxSuccessfulUses   Int           @default(1)
+  overuseAction       OveruseAction @default(WARN)
+  overuseMessage      String?
+  createdAt           DateTime      @default(now())
+  updatedAt           DateTime      @updatedAt
+  batch               Batch         @relation(fields: [batchId], references: [id], onDelete: Restrict)
+  verificationEvents  VerificationEvent[]
+
+  @@index([batchId, status, createdAt])
+}
+
+model VerificationEvent {
+  id        String               @id @default(cuid())
+  itemId    String?
+  eventType VerificationEventType
+  result    String?
+  ipAddress String?
+  country   String?
+  city      String?
+  userAgent String?
+  createdAt DateTime             @default(now())
+  item      Item?                @relation(fields: [itemId], references: [id], onDelete: Restrict)
+
+  @@index([itemId, createdAt])
+  @@index([eventType, createdAt])
+}
+
+model SecurityEvent {
+  id        String   @id @default(cuid())
+  eventType String
+  tokenHash String?
+  ipAddress String?
+  userAgent String?
+  createdAt DateTime @default(now())
+
+  @@index([eventType, createdAt])
+  @@index([tokenHash, createdAt])
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String?
+  companyId  String?
+  action     String
+  entityType String
+  entityId   String
+  metadata   Json?
+  createdAt  DateTime @default(now())
+  actor      User?    @relation(fields: [actorId], references: [id], onDelete: SetNull)
+  company    Company? @relation(fields: [companyId], references: [id], onDelete: SetNull)
+
+  @@index([companyId, createdAt])
+  @@index([actorId, createdAt])
+  @@index([entityType, entityId])
+}
+
+model Plan {
+  id          String         @id @default(cuid())
+  name        String         @unique
+  price       Decimal        @db.Decimal(10, 2)
+  currency    String         @default("USD")
+  itemLimit   Int
+  memberLimit Int
+  periodDays  Int            @default(30)
+  isActive    Boolean        @default(true)
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+  subscriptions Subscription[]
+}
+
+model Subscription {
+  id                String             @id @default(cuid())
+  companyId         String
+  planId            String
+  status            SubscriptionStatus @default(TRIALING)
+  currentPeriodEnd  DateTime?
+  canceledAt        DateTime?
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @updatedAt
+  company           Company            @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  plan              Plan               @relation(fields: [planId], references: [id], onDelete: Restrict)
+  payments          Payment[]
+
+  @@index([companyId, status])
+}
+
+model Payment {
+  id                    String        @id @default(cuid())
+  subscriptionId        String
+  provider              String
+  providerReference     String        @unique
+  amount                Decimal       @db.Decimal(10, 2)
+  currency              String
+  status                PaymentStatus @default(PENDING)
+  processedAt           DateTime?
+  createdAt             DateTime      @default(now())
+  subscription          Subscription  @relation(fields: [subscriptionId], references: [id], onDelete: Restrict)
+
+  @@index([subscriptionId, status])
+}
+
+model ProcessedPaymentEvent {
+  id          String   @id @default(cuid())
+  provider    String
+  eventId     String
+  eventType   String
+  payloadHash String
+  receivedAt  DateTime @default(now())
+  processedAt DateTime @default(now())
+
+  @@unique([provider, eventId])
+  @@index([receivedAt])
+}
+
+model EmailVerificationToken {
+  id        String    @id @default(cuid())
+  userId    String
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+  user      User      @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([userId, expiresAt, usedAt])
+}
+
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  userId    String
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+  user      User      @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([userId, expiresAt, usedAt])
+}
+
+model PrintExportJob {
+  id                String    @id @default(cuid())
+  companyId         String
+  createdById       String
+  payloadCiphertext String
+  payloadNonce      String
+  payloadTag        String
+  expiresAt         DateTime
+  downloadedAt      DateTime?
+  createdAt         DateTime  @default(now())
+  company           Company   @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  createdBy         User      @relation("PrintExportCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  idempotencyKeys   IdempotencyKey[]
+
+  @@index([companyId, createdAt])
+  @@index([expiresAt, downloadedAt])
+}
+
+model IdempotencyKey {
+  id          String   @id @default(cuid())
+  companyId   String
+  key         String
+  requestHash String
+  exportJobId String?
+  createdAt   DateTime @default(now())
+  company     Company  @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  exportJob   PrintExportJob? @relation(fields: [exportJobId], references: [id], onDelete: SetNull)
+
+  @@unique([companyId, key])
+  @@index([createdAt])
+}
+model Invitation {
+  id          String           @id @default(cuid())
+  companyId   String
+  inviterId   String
+  email       String
+  role        CompanyRole
+  tokenHash   String           @unique
+  expiresAt   DateTime
+  acceptedAt  DateTime?
+  createdAt   DateTime         @default(now())
+  company     Company          @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  inviter     User             @relation("InvitationInviter", fields: [inviterId], references: [id], onDelete: Restrict)
+
+  @@index([companyId, email, expiresAt])
+}
