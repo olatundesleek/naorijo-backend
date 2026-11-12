@@ -19,7 +19,7 @@ const cookieOptions = {
 
 export async function registerCompany(req, res, next) {
   try {
-    res.status(201).json(await authService.registerCompany(req.auth.user.id, validate(registerCompanySchema, req.body)));
+    res.status(201).json(await authService.registerCompany(validate(registerCompanySchema, req.body)));
   } catch (error) { next(error); }
 }
 

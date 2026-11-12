@@ -1,15 +1,15 @@
 import { Router } from 'express';
 import { authenticate } from '../../middleware/authenticate.js';
 import { csrfProtection } from '../../middleware/csrfProtection.js';
-import { requirePlatformAccess } from '../../middleware/platformAccess.js';
 import { loginLimiter } from '../../middleware/rateLimiters.js';
 import { redisRateLimit } from '../../middleware/rateLimiters.js';
 import * as controller from './controller.js';
 
 const router = Router();
 const recoveryLimiter = redisRateLimit({ prefix: 'rate:recovery', limit: 5, windowSeconds: 3600 });
+const companyRegistrationLimiter = redisRateLimit({ prefix: 'rate:company-registration', limit: 5, windowSeconds: 3600 });
 
-router.post('/register-company', authenticate, requirePlatformAccess('companies:manage'), csrfProtection, controller.registerCompany);
+router.post('/register-company', companyRegistrationLimiter, controller.registerCompany);
 router.post('/login', loginLimiter, controller.login);
 router.get('/me', authenticate, controller.me);
 router.post('/logout', authenticate, csrfProtection, controller.logout);

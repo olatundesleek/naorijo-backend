@@ -41,7 +41,7 @@ async function sendEmailVerification(userId, email, name) {
   });
 }
 
-export async function registerCompany(actorId, input) {
+export async function registerCompany(input) {
   const email = normalizeEmail(input.email);
   const companySlug = slugify(input.companyName);
   const passwordHash = await argon2.hash(input.password, { type: argon2.argon2id });
@@ -60,7 +60,7 @@ export async function registerCompany(actorId, input) {
     const company = await tx.company.create({ data: { displayId: generateDisplayId('CO'), name: input.companyName, slug: companySlug } });
     await tx.companyMember.create({ data: { userId: createdUser.id, companyId: company.id, role: 'ADMIN' } });
     await tx.auditLog.create({
-      data: { actorId, companyId: company.id, action: 'company.registered', entityType: 'Company', entityId: company.id }
+      data: { actorId: createdUser.id, companyId: company.id, action: 'company.registered', entityType: 'Company', entityId: company.id }
     });
     return {
       id: createdUser.id,

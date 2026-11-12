@@ -15,7 +15,7 @@ const mocks = vi.hoisted(() => {
       invitation: { create: fn(), findFirst: fn(), update: fn(), updateMany: fn(), count: fn(), findMany: fn() },
       companyMember: { findFirst: fn(), findMany: fn(), findUnique: fn(), count: fn(), upsert: fn(), update: fn(), create: fn() },
       platformMember: { findFirst: fn(), findMany: fn(), findUnique: fn(), upsert: fn(), create: fn() },
-      company: { findUnique: fn(), findFirst: fn(), findMany: fn(), update: fn() },
+      company: { findUnique: fn(), findFirst: fn(), findMany: fn(), create: fn(), update: fn() },
       product: { findFirst: fn(), findMany: fn(), create: fn(), update: fn() },
       batch: { findFirst: fn(), create: fn() },
       item: { findUnique: fn(), findFirst: fn(), findMany: fn(), create: fn(), update: fn(), updateMany: fn(), count: fn() },
@@ -187,15 +187,48 @@ describe('tenant and public verification boundaries', () => {
       expect(mocks.prisma.user.create).not.toHaveBeenCalled();
     });
 
-    it('requires platform access to bootstrap a company and its first user', async () => {
-      await request(app).post('/api/v1/auth/register-company').send({
+    it('lets a visitor register a company and become its first admin', async () => {
+      mocks.prisma.user.create.mockResolvedValue({
+        id: 'new-user',
+        displayId: 'US000000000002',
+        email: 'new@example.com',
+        firstName: 'New',
+        middleName: null,
+        lastName: 'User'
+      });
+      mocks.prisma.company.create.mockResolvedValue({
+        id: 'new-company',
+        displayId: 'CO000000000002',
+        name: 'New Company',
+        slug: 'new-company'
+      });
+      mocks.prisma.companyMember.create.mockResolvedValue({ id: 'new-member' });
+
+      const response = await request(app).post('/api/v1/auth/register-company').send({
         email: 'new@example.com',
         password: 'strong password 123',
         firstName: 'New',
         lastName: 'User',
         companyName: 'New Company'
-      }).expect(401);
-      expect(mocks.prisma.user.create).not.toHaveBeenCalled();
+      }).expect(201);
+
+      expect(response.body.user).toMatchObject({
+        email: 'new@example.com',
+        verificationRequired: true
+      });
+      expect(response.body.company).toMatchObject({ name: 'New Company', slug: 'new-company' });
+      expect(mocks.prisma.companyMember.create).toHaveBeenCalledWith({
+        data: { userId: 'new-user', companyId: 'new-company', role: 'ADMIN' }
+      });
+      expect(mocks.prisma.auditLog.create).toHaveBeenCalledWith({
+        data: {
+          actorId: 'new-user',
+          companyId: 'new-company',
+          action: 'company.registered',
+          entityType: 'Company',
+          entityId: 'new-company'
+        }
+      });
     });
 
     it('creates a pending company user and attaches the company role', async () => {
