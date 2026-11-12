@@ -6,7 +6,7 @@ import { redisRateLimit } from '../../middleware/rateLimiters.js';
 import * as controller from './controller.js';
 
 const router = Router();
-const recoveryLimiter = redisRateLimit({ prefix: 'rate:recovery', limit: 5, windowSeconds: 3600 });
+const recoveryLimiter = redisRateLimit({ prefix: 'rate:recovery', limit: 15, windowSeconds: 3600 });
 const companyRegistrationLimiter = redisRateLimit({ prefix: 'rate:company-registration', limit: 5, windowSeconds: 3600 });
 
 router.post('/register-company', companyRegistrationLimiter, controller.registerCompany);

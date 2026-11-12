@@ -9,3 +9,4 @@ logs/
 exports/
 generated-exports/
 dist/
+prisma/seed.js
