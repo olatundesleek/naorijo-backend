@@ -13,7 +13,7 @@ import {
 const cookieOptions = {
   httpOnly: true,
   secure: env.COOKIE_SECURE === 'true' || env.NODE_ENV === 'production',
-  sameSite: 'strict',
+  sameSite: env.NODE_ENV === 'production' ? "none" : "lax",
   path: '/'
 };
 

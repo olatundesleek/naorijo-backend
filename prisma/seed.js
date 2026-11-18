@@ -5,9 +5,13 @@ import { PrismaClient } from '../src/generated/prisma/client.js';
 import { randomBytes, createHmac } from 'node:crypto';
 import { generateDisplayId } from '../src/utils/crypto.js';
 
+
+
 if (process.env.NODE_ENV !== 'development') {
   throw new Error('Refusing to seed outside NODE_ENV=development');
 }
+
+
 const seedUsers = [
   { email: process.env.SEED_SUPER_ADMIN_EMAIL, password: process.env.SEED_SUPER_ADMIN_PASSWORD, firstName: 'Development', lastName: 'Super Admin', platformRole: 'SUPER_ADMIN' },
   { email: process.env.SEED_COMPANY_ADMIN_EMAIL, password: process.env.SEED_COMPANY_ADMIN_PASSWORD, firstName: 'Sample', lastName: 'Company Admin', role: 'ADMIN' },
