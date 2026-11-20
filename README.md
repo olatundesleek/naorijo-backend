@@ -74,6 +74,8 @@ The development seed is guarded. Set `NODE_ENV=development`, unique email/passwo
 5. Use `GET /api/v1/auth/me` to restore the current user, company memberships, platform membership, and CSRF token after a page reload.
 6. Log out with `POST /api/v1/auth/logout`; use `POST /api/v1/auth/logout-all` to revoke all of the current user's sessions. Both require the CSRF header.
 
+Authentication middleware validates a short-lived Redis session record and a per-user auth-state marker atomically; it does not query PostgreSQL for each authenticated request. PostgreSQL remains the durable account/session store. Redis failures fail authentication closed. Account deactivation records a PostgreSQL revocation outbox event, so Redis cleanup can be retried after temporary outages.
+
 The cookie is HttpOnly, SameSite=Strict, and Secure in production (or when `COOKIE_SECURE=true`). Configure `CORS_ORIGINS` as a comma-separated exact-origin allowlist; credentialed requests are enabled. A client cannot sign itself up through `/auth/register`; that endpoint is not implemented. Company and platform accounts are created through the routes documented below.
 
 ## Validation and errors
@@ -187,12 +189,13 @@ Company path parameters accept an internal company ID or its `CO...` display ID.
 | `POST /api/v1/companies/:companyId/members` | Company member with `members:manage` | Account fields from registration plus `role` | `201`; user verification email is sent |
 | `PATCH /api/v1/companies/:companyId/members/:memberId` | Company member with `members:manage` | `role` | `200 { "member": ... }` |
 | `POST /api/v1/companies/:companyId/members/:memberId/suspend` | Company member with `members:manage` | None | `204` |
+| `DELETE /api/v1/companies/:companyId/members/:memberId` | Company member with `members:manage` + CSRF | None | `204`; removes only that company's membership |
 | `POST /api/v1/companies/:companyId/members/:memberId/reactivate` | Company member with `members:manage` | None | `204` |
 | `GET /api/v1/companies/:companyId/invitations` | Company member with `members:read` | None | `200 { "invitations": [...] }` |
 | `POST /api/v1/companies/:companyId/invitations` | Company member with `members:manage` | `email`, `role` | `201 { "invitation": ... }` |
 | `POST /api/v1/invitations/accept` | Any signed-in user + CSRF | `token` (32–256 characters) | `200 { "member": ... }` |
 
-Valid company member roles are `ADMIN`, `PRODUCT_MANAGER`, and `EDITOR`. Invitation email has the same 254-character email validation as registration. A company needs an active subscription for member creation, invitations, and reactivation. Invitations expire after seven days and can only be accepted by a signed-in, email-verified user whose email matches the invitation. The last active `ADMIN` cannot be demoted or suspended.
+Valid company member roles are `ADMIN`, `PRODUCT_MANAGER`, and `EDITOR`. Invitation email has the same 254-character email validation as registration. A company needs an active subscription for member creation, invitations, and reactivation. Invitations expire after seven days and can only be accepted by a signed-in, email-verified user whose email matches the invitation. The last active `ADMIN` cannot be demoted, suspended, or deleted. Deleting a membership does not delete the user's account or memberships in other companies.
 
 Create member:
 
@@ -246,6 +249,7 @@ Company, product, and batch path IDs accept an internal ID or a display ID. Prod
 | `POST /api/v1/companies/:companyId/products` | `products:create` | `name` required; optional `slug`, `description` | `201 { "product": ... }` |
 | `GET /api/v1/companies/:companyId/products/:productId` | `products:read` | None | `200 { "product": ... }` |
 | `PATCH /api/v1/companies/:companyId/products/:productId` | `products:update` | At least one supported product field | `200 { "product": ... }` |
+| `POST /api/v1/companies/:companyId/products/:productId/image` | `products:update` + CSRF | Multipart `image` file; JPEG/PNG/WebP, max 5 MB | `200 { "product": ... }` |
 | `POST /api/v1/companies/:companyId/products/:productId/archive` | `products:archive` | None | `204` |
 | `GET /api/v1/companies/:companyId/products/:productId/batches` | `batches:read` | None | `200 { "batches": [...] }` |
 | `POST /api/v1/companies/:companyId/products/:productId/batches` | `batches:create` | `batchNumber` required; optional `productionDate`, `expiryDate` | `201 { "batch": ... }` |
@@ -258,7 +262,9 @@ Company, product, and batch path IDs accept an internal ID or a display ID. Prod
 | `POST /api/v1/companies/:companyId/items/:itemId/revoke` | `items:revoke` | None | `200 { "item": ... }` |
 | `POST /api/v1/companies/:companyId/items/:itemId/recall` | `items:revoke` | None | `200 { "item": ... }` |
 
-Product fields: `name` and `slug` are trimmed strings, 1–160 characters; `description` is up to 10,000 characters and may be empty. Create requires `name`; update requires at least one field. If no slug is supplied, the name is used to generate it.
+Product fields: `name` and `slug` are trimmed strings, 1–160 characters; `description` is up to 10,000 characters and may be empty. Create requires `name`; update requires at least one field. If no slug is supplied, the name is used to generate it. Companies cannot choose a storage provider or submit image storage metadata.
+
+Upload or replace a product image using `POST /api/v1/companies/:companyId/products/:productId/image` as `multipart/form-data` with a single `image` file and the normal CSRF header. JPEG, PNG, and WebP files up to 5 MB are accepted. The platform selects the destination with `PRODUCT_IMAGE_STORAGE_PROVIDER` (`S3` or `CLOUDINARY`) and supplies the corresponding credentials/configuration; the response exposes the resulting `imageUrl`, not the storage key or provider. For S3, configure a public read policy or `PRODUCT_IMAGE_PUBLIC_BASE_URL` for a CDN; object writes use server-side AES-256 encryption.
 
 Batch fields: `batchNumber` is a trimmed string, 1–100 characters; `productionDate` and `expiryDate` are dates. Create requires `batchNumber`; update requires at least one field. Expiry cannot be earlier than production.
 
@@ -309,6 +315,7 @@ All platform routes require a signed-in user with an active platform membership 
 | Method and path | Permission | Request body / query | Success |
 |---|---|---|---|
 | `GET /api/v1/platform-admin/members` | `platform:members:read` | None | `200 { "members": [...] }` |
+| `PATCH /api/v1/platform-admin/members/:userId/status` | `platform:members:manage` + CSRF | None | `200 { "user": { "id": "...", "status": "INACTIVE" } }`; revokes all sessions |
 | `POST /api/v1/platform-admin/members` | `platform:members:manage` | Account fields plus platform `role` | `201`; verification email is sent |
 | `GET /api/v1/platform-admin/companies` | `companies:read` | None | `200 { "companies": [...] }` |
 | `PATCH /api/v1/platform-admin/companies/:companyId/status` | `companies:manage` | `isActive` boolean | `200 { "company": ... }` |

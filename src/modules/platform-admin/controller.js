@@ -9,7 +9,8 @@ import {
   planCreateSchema,
   planParamsSchema,
   planUpdateSchema,
-  subscriptionAssignmentSchema
+  subscriptionAssignmentSchema,
+  userParamsSchema
 } from './validation.js';
 
 export async function listCompanies(_req, res, next) {
@@ -20,6 +21,14 @@ export async function listCompanies(_req, res, next) {
 export async function listPlatformMembers(_req, res, next) {
   try { res.json({ members: await adminService.listPlatformMembers() }); }
   catch (error) { next(error); }
+}
+
+export async function deactivateUser(req, res, next) {
+  try {
+    const { userId } = validate(userParamsSchema, req.params);
+    const user = await adminService.deactivateUser(userId, req.auth.user.id);
+    res.json({ user });
+  } catch (error) { next(error); }
 }
 
 export async function createPlatformMember(req, res, next) {

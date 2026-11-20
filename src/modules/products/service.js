@@ -5,6 +5,7 @@ import { generateDisplayId, generateVerificationCode, hashVerificationCode, rand
 import { encryptPayload, decryptPayload } from '../../utils/encryptedPayload.js';
 import { env } from '../../config/env.js';
 import { serializableTransaction } from '../../lib/serializableTransaction.js';
+import { deleteProductImageAsset, uploadProductImageAsset } from '../../lib/productImageStorage.js';
 
 const scopedProductWhere = (companyId, productId) => ({
   companyId,
@@ -18,15 +19,18 @@ const scopedBatchWhere = (companyId, batchId) => ({
 export async function listProducts(companyId) {
   return prisma.product.findMany({
     where: { companyId }, orderBy: { createdAt: 'desc' },
-    select: { id: true, displayId: true, name: true, slug: true, description: true, isActive: true, createdAt: true, _count: { select: { batches: true } } }
+    select: { id: true, displayId: true, name: true, slug: true, description: true, imageUrl: true, isActive: true, createdAt: true, _count: { select: { batches: true } } }
   });
 }
 
 export async function createProduct(companyId, actorId, body) {
   const input = body;
   const product = await prisma.product.create({
-    data: { displayId: generateDisplayId('PI'), companyId, name: input.name, slug: slugify(input.slug ?? input.name), description: input.description },
-    select: { id: true, displayId: true, name: true, slug: true, description: true, isActive: true, createdAt: true }
+    data: {
+      displayId: generateDisplayId('PI'), companyId, name: input.name,
+      slug: slugify(input.slug ?? input.name), description: input.description
+    },
+    select: { id: true, displayId: true, name: true, slug: true, description: true, imageUrl: true, isActive: true, createdAt: true }
   });
   await prisma.auditLog.create({ data: { actorId, companyId, action: 'product.created', entityType: 'Product', entityId: product.id } });
   return product;
@@ -35,7 +39,7 @@ export async function createProduct(companyId, actorId, body) {
 export async function getProduct(companyId, productId) {
   const product = await prisma.product.findFirst({
     where: scopedProductWhere(companyId, productId),
-    select: { id: true, displayId: true, name: true, slug: true, description: true, isActive: true, maxSuccessfulUses: true, overuseAction: true, overuseMessage: true, createdAt: true }
+    select: { id: true, displayId: true, name: true, slug: true, description: true, imageUrl: true, isActive: true, maxSuccessfulUses: true, overuseAction: true, overuseMessage: true, createdAt: true }
   });
   if (!product) throw new AppError(404, 'NOT_FOUND', 'Resource not found');
   return product;
@@ -49,10 +53,73 @@ export async function updateProduct(companyId, productId, actorId, body) {
   if (input.slug || input.name) data.slug = slugify(input.slug ?? input.name);
   const product = await prisma.product.update({
     where: { id: existing.id }, data,
-    select: { id: true, displayId: true, name: true, slug: true, description: true, isActive: true, updatedAt: true }
+    select: { id: true, displayId: true, name: true, slug: true, description: true, imageUrl: true, isActive: true, updatedAt: true }
   });
   await prisma.auditLog.create({ data: { actorId, companyId, action: 'product.updated', entityType: 'Product', entityId: product.id } });
   return product;
+}
+
+export async function uploadProductImage(companyId, productId, actorId, image) {
+  const product = await prisma.product.findFirst({
+    where: scopedProductWhere(companyId, productId)
+  });
+  if (!product) throw new AppError(404, 'NOT_FOUND', 'Resource not found');
+
+  const uploaded = await uploadProductImageAsset({
+    buffer: image.buffer,
+    contentType: image.contentType,
+    extension: image.extension
+  });
+  let updated;
+  try {
+    updated = await prisma.$transaction(async (tx) => {
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        const current = await tx.product.findFirst({
+          where: { id: product.id, companyId },
+          select: { imageStorageKey: true, imageStorageProvider: true }
+        });
+        if (!current) throw new AppError(404, 'NOT_FOUND', 'Resource not found');
+        const changed = await tx.product.updateMany({
+          where: { id: product.id, companyId, imageStorageKey: current.imageStorageKey },
+          data: {
+            imageUrl: uploaded.imageUrl,
+            imageStorageKey: uploaded.storageKey,
+            imageStorageProvider: uploaded.provider
+          }
+        });
+        if (changed.count !== 1) continue;
+
+        const saved = await tx.product.findUnique({
+          where: { id: product.id },
+          select: { id: true, displayId: true, name: true, imageUrl: true, updatedAt: true }
+        });
+        await tx.auditLog.create({
+          data: { actorId, companyId, action: 'product.image_uploaded', entityType: 'Product', entityId: product.id }
+        });
+        return { product: saved, previousImage: current };
+      }
+      throw new AppError(409, 'PRODUCT_IMAGE_CONFLICT', 'The product image changed concurrently; retry the upload');
+    });
+  } catch (error) {
+    try {
+      await deleteProductImageAsset({ provider: uploaded.provider, storageKey: uploaded.storageKey });
+    } catch (cleanupError) {
+      console.error('Could not remove an image uploaded for a failed product update:', cleanupError.message);
+    }
+    throw error;
+  }
+
+  if (updated.previousImage.imageStorageProvider && updated.previousImage.imageStorageKey) {
+    try {
+      await deleteProductImageAsset({
+        provider: updated.previousImage.imageStorageProvider,
+        storageKey: updated.previousImage.imageStorageKey
+      });
+    } catch (error) {
+      console.error('The previous product image could not be removed:', error.message);
+    }
+  }
+  return updated.product;
 }
 
 export async function archiveProduct(companyId, productId, actorId) {

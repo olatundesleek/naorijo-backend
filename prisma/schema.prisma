@@ -9,8 +9,14 @@ datasource db {
 
 enum UserStatus {
   ACTIVE
+  INACTIVE
   DISABLED
   PENDING
+}
+
+enum ImageStorageProvider {
+  CLOUDINARY
+  S3
 }
 
 enum PlatformRole {
@@ -87,6 +93,7 @@ model User {
   emailVerificationTokens EmailVerificationToken[]
   passwordResetTokens PasswordResetToken[]
   printExportJobs PrintExportJob[] @relation("PrintExportCreator")
+  sessionRevocations UserSessionRevocationOutbox[]
 }
 
 model PlatformMember {
@@ -115,6 +122,20 @@ model LoginSession {
   user        User      @relation(fields: [userId], references: [id], onDelete: Restrict)
 
   @@index([userId, revokedAt, expiresAt])
+}
+
+model UserSessionRevocationOutbox {
+  id               String    @id @default(cuid())
+  userId           String
+  blockOperationId String?
+  attempts         Int       @default(0)
+  lastError        String?
+  createdAt        DateTime  @default(now())
+  nextAttemptAt    DateTime  @default(now())
+  processedAt      DateTime?
+  user             User      @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([processedAt, nextAttemptAt])
 }
 
 model Company {
@@ -160,6 +181,9 @@ model Product {
   name                    String
   slug                    String
   description             String?
+  imageUrl                String?
+  imageStorageKey         String?
+  imageStorageProvider    ImageStorageProvider?
   isActive                Boolean       @default(true)
   maxSuccessfulUses       Int?
   overuseAction           OveruseAction?

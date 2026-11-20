@@ -10,10 +10,11 @@ const mocks = vi.hoisted(() => {
     prisma: {
       user: { findUnique: fn(), findFirst: fn(), create: fn(), update: fn(), updateMany: fn() },
       loginSession: { create: fn(), findFirst: fn(), update: fn(), updateMany: fn() },
+      userSessionRevocationOutbox: { create: fn(), findMany: fn(), update: fn() },
       emailVerificationToken: { updateMany: fn(), create: fn(), findFirst: fn() },
       passwordResetToken: { updateMany: fn(), create: fn(), findFirst: fn() },
       invitation: { create: fn(), findFirst: fn(), update: fn(), updateMany: fn(), count: fn(), findMany: fn() },
-      companyMember: { findFirst: fn(), findMany: fn(), findUnique: fn(), count: fn(), upsert: fn(), update: fn(), create: fn() },
+      companyMember: { findFirst: fn(), findMany: fn(), findUnique: fn(), count: fn(), upsert: fn(), update: fn(), create: fn(), delete: fn() },
       platformMember: { findFirst: fn(), findMany: fn(), findUnique: fn(), upsert: fn(), create: fn() },
       company: { findUnique: fn(), findFirst: fn(), findMany: fn(), create: fn(), update: fn() },
       product: { findFirst: fn(), findMany: fn(), create: fn(), update: fn() },
@@ -58,7 +59,18 @@ const user = {
 
 function resetMocks() {
   vi.clearAllMocks();
-  mocks.redis.eval.mockResolvedValue('1');
+  mocks.redis.eval.mockImplementation(async (script) => {
+    if (script.includes('VALIDATE_SESSION_CACHE')) {
+      return JSON.stringify({
+        userId: user.id,
+        sessionId: 'session-1',
+        expiresAt: Date.now() + 60_000,
+        csrfToken: 'csrf-value'
+      });
+    }
+    if (script.includes('BLOCK_USER_SESSIONS')) return 'owner';
+    return 1;
+  });
   mocks.redis.set.mockResolvedValue('OK');
   mocks.redis.sAdd.mockResolvedValue(1);
   mocks.redis.expire.mockResolvedValue(1);
@@ -66,6 +78,7 @@ function resetMocks() {
   mocks.prisma.loginSession.create.mockResolvedValue({ id: 'session-1' });
   mocks.prisma.loginSession.findFirst.mockResolvedValue({ id: 'session-1', userId: user.id });
   mocks.prisma.companyMember.findFirst.mockResolvedValue({ id: 'member-1', role: 'ADMIN', status: 'ACTIVE', userId: user.id, companyId: 'company-1' });
+  mocks.prisma.companyMember.findMany.mockResolvedValue([]);
   mocks.prisma.company.findFirst.mockImplementation(async ({ where }) =>
     where.OR.some((condition) => condition.id === 'company-1' || condition.displayId === 'CO000000000001')
       ? { id: 'company-1' }
@@ -92,10 +105,17 @@ function resetMocks() {
   mocks.prisma.passwordResetToken.findFirst.mockResolvedValue({ id: 'reset-token-1', userId: user.id });
   mocks.prisma.user.updateMany.mockResolvedValue({ count: 1 });
   mocks.prisma.user.update.mockResolvedValue({});
+  mocks.prisma.loginSession.update.mockResolvedValue({});
   mocks.prisma.loginSession.updateMany.mockResolvedValue({ count: 1 });
+  mocks.prisma.userSessionRevocationOutbox.create.mockResolvedValue({
+    id: 'revocation-1', userId: user.id
+  });
+  mocks.prisma.userSessionRevocationOutbox.findMany.mockResolvedValue([]);
+  mocks.prisma.userSessionRevocationOutbox.update.mockResolvedValue({});
   mocks.prisma.companyMember.findFirst.mockResolvedValue({ id: 'member-1', role: 'ADMIN', status: 'ACTIVE', companyId: 'company-1', userId: user.id });
   mocks.prisma.companyMember.findUnique.mockResolvedValue(null);
   mocks.prisma.companyMember.count.mockResolvedValue(0);
+  mocks.prisma.companyMember.delete.mockResolvedValue({});
   mocks.prisma.platformMember.findFirst.mockResolvedValue(null);
   mocks.prisma.invitation.count.mockResolvedValue(0);
   mocks.prisma.invitation.findFirst.mockResolvedValue(null);
@@ -132,20 +152,98 @@ describe('authentication API with mocked infrastructure', () => {
     expect(response.headers['set-cookie'][0]).toContain(`${env.COOKIE_NAME}=`);
     const savedSession = mocks.prisma.loginSession.create.mock.calls[0][0].data;
     expect(savedSession.tokenHash).not.toBe(response.headers['set-cookie'][0].split(';')[0].split('=').at(-1));
-    expect(mocks.redis.set).toHaveBeenCalled();
+    expect(mocks.redis.eval).toHaveBeenCalledWith(
+      expect.stringContaining('CREATE_SESSION_CACHE'),
+      expect.objectContaining({ keys: expect.arrayContaining([expect.stringContaining('user-sessions:')]) })
+    );
+  });
+
+  it('uses the Redis cache for authentication without querying PostgreSQL sessions', async () => {
+    const response = await request(app)
+      .get('/api/v1/auth/me')
+      .set('Cookie', `${env.COOKIE_NAME}=opaque`)
+      .expect(200);
+    expect(response.body.user.id).toBe(user.id);
+    expect(mocks.prisma.loginSession.findFirst).not.toHaveBeenCalled();
   });
 
   it('rejects bad passwords and unavailable Redis without accepting a session', async () => {
     await request(app).post('/api/v1/auth/login').send({
       email: user.email, password: 'incorrect password'
     }).expect(401);
-    mocks.redis.get.mockRejectedValueOnce(new Error('redis offline'));
+    mocks.redis.eval.mockRejectedValueOnce(new Error('redis offline'));
     await request(app).get('/api/v1/auth/me').set('Cookie', `${env.COOKIE_NAME}=opaque`).expect(503);
   });
 
-  it('rejects a cached session when the durable session has been revoked', async () => {
-    mocks.prisma.loginSession.findFirst.mockResolvedValueOnce(null);
+  it('rejects a session invalidated in Redis without falling back to PostgreSQL', async () => {
+    mocks.redis.eval.mockResolvedValueOnce(null);
     await request(app).get('/api/v1/auth/me').set('Cookie', `${env.COOKIE_NAME}=opaque`).expect(401);
+    expect(mocks.prisma.loginSession.findFirst).not.toHaveBeenCalled();
+  });
+
+  it('rejects product image content that is not a supported image format', async () => {
+    await request(app)
+      .post('/api/v1/companies/company-1/products/product-1/image')
+      .set('Cookie', `${env.COOKIE_NAME}=opaque`)
+      .set('X-CSRF-Token', 'csrf-value')
+      .attach('image', Buffer.from('not an image'), { filename: 'image.jpg', contentType: 'image/jpeg' })
+      .expect(400);
+    expect(mocks.prisma.product.findFirst).not.toHaveBeenCalled();
+  });
+
+  it('deactivates an account and durably queues session revocation', async () => {
+    mocks.prisma.platformMember.findFirst.mockResolvedValue({
+      id: 'platform-admin', role: 'SUPER_ADMIN', status: 'ACTIVE'
+    });
+    mocks.prisma.user.findUnique
+      .mockResolvedValueOnce({ id: user.id, status: 'ACTIVE' })
+      .mockResolvedValueOnce({ id: user.id, status: 'INACTIVE' });
+    const response = await request(app)
+      .patch(`/api/v1/platform-admin/members/${user.id}/status`)
+      .set('Cookie', `${env.COOKIE_NAME}=opaque`)
+      .set('X-CSRF-Token', 'csrf-value')
+      .send({})
+      .expect(200);
+    expect(response.body.user).toEqual({ id: user.id, status: 'INACTIVE' });
+    expect(mocks.prisma.user.update).toHaveBeenCalledWith({
+      where: { id: user.id }, data: { status: 'INACTIVE' }
+    });
+    expect(mocks.prisma.loginSession.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { userId: user.id, revokedAt: null }
+    }));
+    expect(mocks.prisma.userSessionRevocationOutbox.create).toHaveBeenCalledWith({
+      data: { userId: user.id }
+    });
+  });
+
+  it('reports deactivation after durable scheduling when Redis session cleanup fails', async () => {
+    mocks.prisma.platformMember.findFirst.mockResolvedValue({
+      id: 'platform-admin', role: 'SUPER_ADMIN', status: 'ACTIVE'
+    });
+    mocks.redis.eval.mockImplementation(async (script) => {
+      if (script.includes('VALIDATE_SESSION_CACHE')) {
+        return JSON.stringify({
+          userId: user.id,
+          sessionId: 'session-1',
+          expiresAt: Date.now() + 60_000,
+          csrfToken: 'csrf-value'
+        });
+      }
+      if (script.includes('BLOCK_USER_SESSIONS')) return 'owner';
+      if (script.includes('REVOKE_USER_SESSIONS')) throw new Error('redis unavailable');
+      return 1;
+    });
+    const response = await request(app)
+      .patch(`/api/v1/platform-admin/members/${user.id}/status`)
+      .set('Cookie', `${env.COOKIE_NAME}=opaque`)
+      .set('X-CSRF-Token', 'csrf-value')
+      .send({})
+      .expect(200);
+    expect(response.body.user.status).toBe('INACTIVE');
+    expect(mocks.prisma.userSessionRevocationOutbox.create).toHaveBeenCalled();
+    expect(mocks.prisma.userSessionRevocationOutbox.update).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ attempts: { increment: 3 } })
+    }));
   });
 });
 
@@ -176,6 +274,36 @@ describe('tenant and public verification boundaries', () => {
         OR: [{ id: 'PI000000000001' }, { displayId: 'PI000000000001' }]
       }
     }));
+  });
+
+  it('deletes only the scoped company membership and records the action', async () => {
+    mocks.prisma.companyMember.count.mockResolvedValue(2);
+    await request(app)
+      .delete('/api/v1/companies/company-1/members/member-1')
+      .set('Cookie', `${env.COOKIE_NAME}=opaque`)
+      .set('X-CSRF-Token', 'csrf-value')
+      .expect(204);
+    expect(mocks.prisma.companyMember.delete).toHaveBeenCalledWith({ where: { id: 'member-1' } });
+    expect(mocks.prisma.auditLog.create).toHaveBeenCalledWith({
+      data: {
+        actorId: user.id,
+        companyId: 'company-1',
+        action: 'member.deleted',
+        entityType: 'CompanyMember',
+        entityId: 'member-1',
+        metadata: { userId: user.id, role: 'ADMIN' }
+      }
+    });
+  });
+
+  it('prevents a company from deleting its last active administrator', async () => {
+    mocks.prisma.companyMember.count.mockResolvedValue(1);
+    await request(app)
+      .delete('/api/v1/companies/company-1/members/member-1')
+      .set('Cookie', `${env.COOKIE_NAME}=opaque`)
+      .set('X-CSRF-Token', 'csrf-value')
+      .expect(409);
+    expect(mocks.prisma.companyMember.delete).not.toHaveBeenCalled();
   });
 
   describe('remaining account and tenant endpoints', () => {
@@ -328,7 +456,6 @@ describe('tenant and public verification boundaries', () => {
     });
 
     it('consumes a password reset token, changes the password, and revokes sessions', async () => {
-      mocks.redis.sMembers.mockResolvedValueOnce(['session-hash-1']);
       const response = await request(app).post('/api/v1/auth/reset-password').send({
         token: 'reset-token-012345678901234567890123',
         password: 'new secure password 123'
@@ -338,7 +465,12 @@ describe('tenant and public verification boundaries', () => {
         where: expect.objectContaining({ id: 'reset-token-1', usedAt: null })
       }));
       expect(mocks.prisma.loginSession.updateMany).toHaveBeenCalled();
-      expect(mocks.redis.del).toHaveBeenCalledWith(['session:session-hash-1']);
+      expect(mocks.prisma.userSessionRevocationOutbox.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          userId: user.id,
+          blockOperationId: expect.any(String)
+        })
+      });
     });
 
     it('creates company invitations with a hashed token and an enforced plan limit', async () => {

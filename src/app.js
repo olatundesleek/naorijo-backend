@@ -22,7 +22,7 @@ app.use(cors({
     callback(new Error('Origin is not allowed by CORS'));
   },
   credentials: true,
-  methods: ['GET', 'POST', 'PATCH', 'OPTIONS'],
+  methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Idempotency-Key', 'X-CSRF-Token']
 }));
 app.use('/api/v1/webhooks/payments', express.raw({ type: 'application/json', limit: '64kb' }), paymentRoutes);
