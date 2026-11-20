@@ -1,5 +1,8 @@
 import { prisma } from '../../lib/prisma.js';
+import { randomUUID } from 'node:crypto';
 import { AppError } from '../../middleware/errorHandler.js';
+import { blockUserSessions, releaseUserSessionBlock } from '../../lib/sessionCache.js';
+import { processUserSessionRevocation } from '../../jobs/retryUserSessionRevocations.js';
 
 export async function listCompanies() {
   return prisma.company.findMany({
@@ -19,6 +22,59 @@ export async function listPlatformMembers() {
       user: { select: { id: true, displayId: true, email: true, firstName: true, middleName: true, lastName: true, status: true } }
     }
   });
+}
+
+export async function deactivateUser(userId, actorId) {
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { id: true, status: true }
+  });
+  if (!user) throw new AppError(404, 'NOT_FOUND', 'Resource not found');
+
+  const operationId = randomUUID();
+  let blockResult;
+  try {
+    blockResult = await blockUserSessions(userId, operationId);
+  } catch {
+    throw new AppError(503, 'SESSION_REVOCATION_UNAVAILABLE', 'Could not safely revoke account sessions');
+  }
+  if (blockResult === 'busy') {
+    throw new AppError(503, 'SESSION_REVOCATION_IN_PROGRESS', 'Account session revocation is already in progress');
+  }
+  const ownsBlock = blockResult === 'owner';
+  let event;
+  try {
+    event = await prisma.$transaction(async (tx) => {
+      await tx.user.update({ where: { id: userId }, data: { status: 'INACTIVE' } });
+      await tx.loginSession.updateMany({
+        where: { userId, revokedAt: null },
+        data: { revokedAt: new Date() }
+      });
+      const revocation = await tx.userSessionRevocationOutbox.create({
+        data: { userId }
+      });
+      await tx.auditLog.create({
+        data: { actorId, action: 'user.deactivated', entityType: 'User', entityId: userId }
+      });
+      return revocation;
+    });
+  } catch (error) {
+    if (ownsBlock && user.status === 'ACTIVE') {
+      try {
+        await releaseUserSessionBlock(userId, operationId);
+      } catch (releaseError) {
+        console.error('Could not release the Redis account deactivation marker:', releaseError.message);
+      }
+    }
+    throw error;
+  }
+
+  try {
+    await processUserSessionRevocation(event);
+  } catch (error) {
+    console.error('User session revocation remains pending in the PostgreSQL outbox:', error.message);
+  }
+  return { id: userId, status: 'INACTIVE' };
 }
 
 export async function setCompanyStatus(companyId, actorId, body) {

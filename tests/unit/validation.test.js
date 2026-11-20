@@ -2,7 +2,11 @@ import { describe, expect, it } from 'vitest';
 import Joi from 'joi';
 import { validate } from '../../src/lib/validate.js';
 import { AppError } from '../../src/middleware/errorHandler.js';
-import { generateItemsSchema, listItemsQuerySchema } from '../../src/modules/products/validation.js';
+import {
+  generateItemsSchema,
+  listItemsQuerySchema,
+  productCreateSchema
+} from '../../src/modules/products/validation.js';
 import { verificationCodeSchema } from '../../src/modules/verification/validation.js';
 import { createUserSchema } from '../../src/modules/auth/validation.js';
 
@@ -42,6 +46,14 @@ describe('Joi request validation', () => {
     expect(validate(createUserSchema, { ...user, middleName: 'Morgan' }).middleName).toBe('Morgan');
     expect(() => validate(createUserSchema, { ...user, firstName: undefined })).toThrow(AppError);
     expect(() => validate(createUserSchema, { ...user, lastName: undefined })).toThrow(AppError);
+  });
+
+  it('prevents companies from supplying product image storage metadata', () => {
+    expect(() => validate(productCreateSchema, {
+      name: 'Sample Product',
+      imageStorageProvider: 'CLOUDINARY',
+      imageStorageKey: 'products/item.jpg'
+    })).toThrow(AppError);
   });
 
   it('rejects unsupported keys instead of silently stripping them', () => {

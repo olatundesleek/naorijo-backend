@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { authenticate } from '../../middleware/authenticate.js';
 import { csrfProtection, requireCompanyMembership, requirePermission } from '../../middleware/companyAccess.js';
+import { uploadProductImage } from '../../middleware/productImageUpload.js';
 import { redisRateLimit } from '../../middleware/rateLimiters.js';
 import * as controller from './controller.js';
 
@@ -13,6 +14,7 @@ router.get('/companies/:companyId/products', requirePermission('products:read'),
 router.post('/companies/:companyId/products', requirePermission('products:create'), controller.createProduct);
 router.get('/companies/:companyId/products/:productId', requirePermission('products:read'), controller.getProduct);
 router.patch('/companies/:companyId/products/:productId', requirePermission('products:update'), controller.updateProduct);
+router.post('/companies/:companyId/products/:productId/image', requirePermission('products:update'), uploadProductImage, controller.uploadProductImage);
 router.get('/companies/:companyId/products/:productId/verification-policy', requirePermission('products:read'), controller.getProductVerificationPolicy);
 router.patch('/companies/:companyId/products/:productId/verification-policy', requirePermission('verification-policy:manage'), controller.updateProductVerificationPolicy);
 router.post('/companies/:companyId/products/:productId/archive', requirePermission('products:archive'), controller.archiveProduct);

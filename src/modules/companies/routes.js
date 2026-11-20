@@ -12,6 +12,7 @@ router.get('/companies/:companyId/members', requirePermission('members:read'), c
 router.post('/companies/:companyId/members', requirePermission('members:manage'), controller.createMember);
 router.patch('/companies/:companyId/members/:memberId', requirePermission('members:manage'), controller.changeMemberRole);
 router.post('/companies/:companyId/members/:memberId/suspend', requirePermission('members:manage'), controller.suspendMember);
+router.delete('/companies/:companyId/members/:memberId', requirePermission('members:manage'), controller.deleteMember);
 router.post('/companies/:companyId/members/:memberId/reactivate', requirePermission('members:manage'), controller.reactivateMember);
 router.get('/companies/:companyId/invitations', requirePermission('members:read'), controller.listInvitations);
 router.post('/companies/:companyId/invitations', requirePermission('members:manage'), controller.createInvitation);

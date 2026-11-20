@@ -1,5 +1,7 @@
+import { fileTypeFromBuffer } from 'file-type';
 import * as productService from './service.js';
 import { validate } from '../../lib/validate.js';
+import { AppError } from '../../middleware/errorHandler.js';
 import {
   batchCreateSchema,
   batchUpdateSchema,
@@ -33,6 +35,26 @@ export async function updateProduct(req, res, next) {
   try {
     const { productId } = validate(companyParamsSchema, req.params);
     const product = await productService.updateProduct(req.companyMembership.companyId, productId, req.auth.user.id, validate(productUpdateSchema, req.body));
+    res.json({ product });
+  } catch (error) { next(error); }
+}
+export async function uploadProductImage(req, res, next) {
+  try {
+    if (!req.file) throw new AppError(400, 'PRODUCT_IMAGE_REQUIRED', 'An image file is required');
+    const detectedType = await fileTypeFromBuffer(req.file.buffer);
+    const extensions = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp' };
+    const extension = detectedType && extensions[detectedType.mime];
+    if (!extension) {
+      throw new AppError(400, 'INVALID_PRODUCT_IMAGE', 'Only JPEG, PNG, and WebP images are supported');
+    }
+
+    const { productId } = validate(companyParamsSchema, req.params);
+    const product = await productService.uploadProductImage(
+      req.companyMembership.companyId,
+      productId,
+      req.auth.user.id,
+      { buffer: req.file.buffer, contentType: detectedType.mime, extension }
+    );
     res.json({ product });
   } catch (error) { next(error); }
 }

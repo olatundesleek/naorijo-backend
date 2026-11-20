@@ -42,3 +42,7 @@ export const planParamsSchema = Joi.object({
 export const platformMemberParamsSchema = Joi.object({
   memberId: Joi.string().trim().min(1).max(64).required()
 }).required();
+
+export const userParamsSchema = Joi.object({
+  userId: Joi.string().trim().min(1).max(64).required()
+}).required();

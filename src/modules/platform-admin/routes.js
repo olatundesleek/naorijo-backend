@@ -8,6 +8,7 @@ const router = Router();
 
 router.use(authenticate);
 router.get('/members', requirePlatformAccess('platform:members:read'), controller.listPlatformMembers);
+router.patch('/members/:userId/status', requirePlatformAccess('platform:members:manage'), csrfProtection, controller.deactivateUser);
 router.post('/members', requirePlatformAccess('platform:members:manage'), csrfProtection, controller.createPlatformMember);
 router.get('/companies', requirePlatformAccess('companies:read'), controller.listCompanies);
 router.patch('/companies/:companyId/status', requirePlatformAccess('companies:manage'), csrfProtection, controller.setCompanyStatus);

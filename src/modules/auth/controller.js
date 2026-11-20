@@ -41,8 +41,8 @@ export async function login(req, res, next) {
 
 export async function me(req, res, next) {
   try {
-    const current = await authService.getCurrentUser(req.auth.user.id, req.auth.tokenHash);
-    res.json({ user: req.auth.user, ...current });
+    const current = await authService.getCurrentUser(req.auth.user.id);
+    res.json({ ...current, csrfToken: req.auth.csrfToken });
   } catch (error) { next(error); }
 }
 

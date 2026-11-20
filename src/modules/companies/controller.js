@@ -53,6 +53,14 @@ export async function suspendMember(req, res, next) {
   } catch (error) { next(error); }
 }
 
+export async function deleteMember(req, res, next) {
+  try {
+    validate(referenceParamsSchema, req.params);
+    await companyService.deleteMember(req.companyMembership.companyId, req.params.memberId, req.auth.user.id);
+    res.status(204).end();
+  } catch (error) { next(error); }
+}
+
 export async function reactivateMember(req, res, next) {
   try {
     validate(referenceParamsSchema, req.params);

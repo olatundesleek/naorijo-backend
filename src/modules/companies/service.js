@@ -70,6 +70,24 @@ export async function suspendMember(companyId, memberId, actorId) {
   });
 }
 
+export async function deleteMember(companyId, memberId, actorId) {
+  await serializableTransaction(async (tx) => {
+    const member = await findMember(companyId, memberId, tx);
+    await ensureAdminRemains(tx, companyId, member);
+    await tx.companyMember.delete({ where: { id: member.id } });
+    await tx.auditLog.create({
+      data: {
+        actorId,
+        companyId,
+        action: 'member.deleted',
+        entityType: 'CompanyMember',
+        entityId: member.id,
+        metadata: { userId: member.userId, role: member.role }
+      }
+    });
+  });
+}
+
 export async function reactivateMember(companyId, memberId, actorId) {
   await serializableTransaction(async (tx) => {
     const member = await findMember(companyId, memberId, tx);

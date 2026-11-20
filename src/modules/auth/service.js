@@ -1,11 +1,13 @@
 import argon2 from 'argon2';
+import { randomUUID } from 'node:crypto';
 import { prisma } from '../../lib/prisma.js';
-import { redis } from '../../lib/redis.js';
+import { blockUserSessions, cacheSession, releaseUserSessionBlock, revokeSessionInRedis } from '../../lib/sessionCache.js';
 import { env } from '../../config/env.js';
 import { AppError } from '../../middleware/errorHandler.js';
 import { generateDisplayId, hashSessionToken, normalizeEmail, randomToken, slugify } from '../../utils/crypto.js';
 import { sendEmail } from '../../lib/email.js';
 import { serializableTransaction } from '../../lib/serializableTransaction.js';
+import { processUserSessionRevocation } from '../../jobs/retryUserSessionRevocations.js';
 
 function safeMembership(membership) {
   return {
@@ -261,26 +263,63 @@ export async function resetPassword(token, password) {
   const tokenHash = hashSessionToken(token);
   const now = new Date();
   const passwordHash = await argon2.hash(password, { type: argon2.argon2id });
-  const userId = await prisma.$transaction(async (tx) => {
-    const resetToken = await tx.passwordResetToken.findFirst({
-      where: { tokenHash, usedAt: null, expiresAt: { gt: now } }
-    });
-    if (!resetToken) throw new AppError(400, 'INVALID_RESET_TOKEN', 'Password reset link is invalid or expired');
-    const consumed = await tx.passwordResetToken.updateMany({
-      where: { id: resetToken.id, usedAt: null, expiresAt: { gt: now } },
-      data: { usedAt: now }
-    });
-    if (consumed.count !== 1) throw new AppError(400, 'INVALID_RESET_TOKEN', 'Password reset link is invalid or expired');
-    await tx.user.update({ where: { id: resetToken.userId }, data: { passwordHash } });
-    await tx.loginSession.updateMany({ where: { userId: resetToken.userId, revokedAt: null }, data: { revokedAt: now } });
-    await tx.auditLog.create({
-      data: { actorId: resetToken.userId, action: 'account.password_reset', entityType: 'User', entityId: resetToken.userId }
-    });
-    return resetToken.userId;
+  const pendingToken = await prisma.passwordResetToken.findFirst({
+    where: { tokenHash, usedAt: null, expiresAt: { gt: now } },
+    select: { id: true, userId: true }
   });
-  const hashes = await redis.sMembers(`user-sessions:${userId}`);
-  if (hashes.length) await redis.del(hashes.map((hash) => `session:${hash}`));
-  await redis.del(`user-sessions:${userId}`);
+  if (!pendingToken) throw new AppError(400, 'INVALID_RESET_TOKEN', 'Password reset link is invalid or expired');
+
+  const operationId = randomUUID();
+  let blockResult;
+  try {
+    blockResult = await blockUserSessions(pendingToken.userId, operationId);
+  } catch {
+    throw new AppError(503, 'SESSION_REVOCATION_UNAVAILABLE', 'Could not safely revoke existing sessions');
+  }
+  if (blockResult === 'busy') {
+    throw new AppError(503, 'SESSION_REVOCATION_IN_PROGRESS', 'Account session revocation is already in progress');
+  }
+  const ownsBlock = blockResult === 'owner';
+  let revocation;
+  try {
+    revocation = await prisma.$transaction(async (tx) => {
+      const resetToken = await tx.passwordResetToken.findFirst({
+        where: { tokenHash, usedAt: null, expiresAt: { gt: now } }
+      });
+      if (!resetToken) throw new AppError(400, 'INVALID_RESET_TOKEN', 'Password reset link is invalid or expired');
+      const consumed = await tx.passwordResetToken.updateMany({
+        where: { id: resetToken.id, usedAt: null, expiresAt: { gt: now } },
+        data: { usedAt: now }
+      });
+      if (consumed.count !== 1) throw new AppError(400, 'INVALID_RESET_TOKEN', 'Password reset link is invalid or expired');
+      const updatedUser = await tx.user.updateMany({
+        where: { id: resetToken.userId, status: 'ACTIVE' },
+        data: { passwordHash }
+      });
+      if (updatedUser.count !== 1) throw new AppError(400, 'INVALID_RESET_TOKEN', 'Password reset link is invalid or expired');
+      await tx.loginSession.updateMany({ where: { userId: resetToken.userId, revokedAt: null }, data: { revokedAt: now } });
+      await tx.auditLog.create({
+        data: { actorId: resetToken.userId, action: 'account.password_reset', entityType: 'User', entityId: resetToken.userId }
+      });
+      return tx.userSessionRevocationOutbox.create({
+        data: { userId: resetToken.userId, blockOperationId: ownsBlock ? operationId : null }
+      });
+    });
+  } catch (error) {
+    if (ownsBlock) {
+      try {
+        await releaseUserSessionBlock(pendingToken.userId, operationId);
+      } catch (releaseError) {
+        console.error('Could not release the Redis password-reset marker:', releaseError.message);
+      }
+    }
+    throw error;
+  }
+  try {
+    await processUserSessionRevocation(revocation);
+  } catch (error) {
+    console.error('Password-reset session revocation remains pending in the PostgreSQL outbox:', error.message);
+  }
   return { reset: true };
 }
 
@@ -311,11 +350,38 @@ export async function login(input, requestMetadata) {
     }
   });
   try {
-    await redis.set(`session:${tokenHash}`, JSON.stringify({ userId: user.id, expiresAt: expiresAt.getTime(), csrfToken }), { EX: env.SESSION_TTL_SECONDS });
-    await redis.sAdd(`user-sessions:${user.id}`, tokenHash);
-    await redis.expire(`user-sessions:${user.id}`, env.SESSION_TTL_SECONDS);
+    const cached = await cacheSession({
+      userId: user.id,
+      tokenHash,
+      ttlSeconds: env.SESSION_TTL_SECONDS,
+      session: {
+        userId: user.id,
+        sessionId: session.id,
+        expiresAt: expiresAt.getTime(),
+        csrfToken
+      }
+    });
+    if (Number(cached) !== 1) {
+      await prisma.loginSession.update({ where: { id: session.id }, data: { revokedAt: new Date() } });
+      throw new AppError(401, 'ACCOUNT_UNAVAILABLE', 'Account is unavailable');
+    }
   } catch (error) {
-    await prisma.loginSession.update({ where: { id: session.id }, data: { revokedAt: new Date() } });
+    if (!(error instanceof AppError)) {
+      try {
+        const revocation = await prisma.$transaction(async (tx) => {
+          await tx.loginSession.updateMany({
+            where: { id: session.id, revokedAt: null },
+            data: { revokedAt: new Date() }
+          });
+          return tx.userSessionRevocationOutbox.create({
+            data: { userId: user.id }
+          });
+        });
+        await processUserSessionRevocation(revocation);
+      } catch (cleanupError) {
+        console.error('Login session compensation remains pending or failed:', cleanupError.message);
+      }
+    }
     throw error;
   }
 
@@ -337,31 +403,69 @@ export async function login(input, requestMetadata) {
   };
 }
 
-export async function getCurrentUser(userId, tokenHash) {
-  const memberships = await prisma.companyMember.findMany({
+export async function getCurrentUser(userId) {
+  const [user, memberships, platformMembership] = await Promise.all([
+    prisma.user.findFirst({
+      where: { id: userId, status: 'ACTIVE' },
+      select: { id: true, displayId: true, email: true, firstName: true, middleName: true, lastName: true }
+    }),
+    prisma.companyMember.findMany({
     where: { userId, status: 'ACTIVE', company: { isActive: true } },
     include: { company: { select: { id: true, displayId: true, name: true } } }
-  });
-  const platformMembership = await prisma.platformMember.findFirst({
-    where: { userId, status: 'ACTIVE' }
-  });
-  const cached = await redis.get(`session:${tokenHash}`);
+    }),
+    prisma.platformMember.findFirst({
+      where: { userId, status: 'ACTIVE' }
+    })
+  ]);
+  if (!user) throw new AppError(401, 'UNAUTHENTICATED', 'Account is unavailable');
   return {
+    user,
     memberships: memberships.map(safeMembership),
-    platformMembership: safePlatformMembership(platformMembership),
-    csrfToken: cached ? JSON.parse(cached).csrfToken : null
+    platformMembership: safePlatformMembership(platformMembership)
   };
 }
 
 export async function logout({ sessionId, userId, tokenHash }) {
+  await revokeSessionInRedis(userId, tokenHash);
   await prisma.loginSession.update({ where: { id: sessionId }, data: { revokedAt: new Date() } });
-  await redis.del(`session:${tokenHash}`);
-  await redis.sRem(`user-sessions:${userId}`, tokenHash);
 }
 
 export async function logoutAll(userId) {
-  await prisma.loginSession.updateMany({ where: { userId, revokedAt: null }, data: { revokedAt: new Date() } });
-  const hashes = await redis.sMembers(`user-sessions:${userId}`);
-  if (hashes.length) await redis.del(hashes.map((hash) => `session:${hash}`));
-  await redis.del(`user-sessions:${userId}`);
+  const operationId = randomUUID();
+  let blockResult;
+  try {
+    blockResult = await blockUserSessions(userId, operationId);
+  } catch {
+    throw new AppError(503, 'SESSION_REVOCATION_UNAVAILABLE', 'Could not safely revoke existing sessions');
+  }
+  if (blockResult === 'busy') {
+    throw new AppError(503, 'SESSION_REVOCATION_IN_PROGRESS', 'Account session revocation is already in progress');
+  }
+  const ownsBlock = blockResult === 'owner';
+  let revocation;
+  try {
+    revocation = await prisma.$transaction(async (tx) => {
+      await tx.loginSession.updateMany({
+        where: { userId, revokedAt: null },
+        data: { revokedAt: new Date() }
+      });
+      return tx.userSessionRevocationOutbox.create({
+        data: { userId, blockOperationId: ownsBlock ? operationId : null }
+      });
+    });
+  } catch (error) {
+    if (ownsBlock) {
+      try {
+        await releaseUserSessionBlock(userId, operationId);
+      } catch (releaseError) {
+        console.error('Could not release the Redis logout-all marker:', releaseError.message);
+      }
+    }
+    throw error;
+  }
+  try {
+    await processUserSessionRevocation(revocation);
+  } catch (error) {
+    console.error('Logout-all session revocation remains pending in the PostgreSQL outbox:', error.message);
+  }
 }
